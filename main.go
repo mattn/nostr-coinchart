@@ -148,9 +148,14 @@ func generate(data [][]any, coin string, span int, sign func(*nostr.Event) error
 		})
 	}
 
-	dig := "¥%4.0f"
+	dig := "$"
+	if strings.HasSuffix(coin, "JPY") {
+		dig = "¥"
+	}
 	if float64(math.Log10(points[len(points)-1].Y)) <= 2 {
-		dig = "¥%0.4f"
+		dig += "%0.4f"
+	} else {
+		dig += "%4.0f"
 	}
 
 	p := plot.New()
