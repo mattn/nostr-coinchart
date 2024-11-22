@@ -24,6 +24,7 @@ import (
 	"github.com/mattn/go-nostrbuild"
 	"github.com/nbd-wtf/go-nostr"
 	"github.com/nbd-wtf/go-nostr/nip19"
+	"github.com/xhit/go-str2duration/v2"
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
@@ -260,7 +261,7 @@ func handler(nsec string) func(w http.ResponseWriter, r *http.Request) {
 		span := 180
 		interval := "1m"
 		for i := 1; i < len(tok); i++ {
-			tmp, err := time.ParseDuration(tok[i])
+			tmp, err := str2duration.ParseDuration(tok[i])
 			if err == nil {
 				span = int(tmp.Minutes())
 			} else if pat.MatchString(tok[i]) {
