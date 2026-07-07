@@ -19,7 +19,6 @@ import (
 
 	"go-hep.org/x/hep/hplot"
 
-	//"github.com/dustin/go-humanize"
 	_ "github.com/lib/pq"
 	"github.com/mattn/go-nostrbuild"
 	"github.com/nbd-wtf/go-nostr"
@@ -36,6 +35,36 @@ const name = "nostr-coinchart"
 const version = "0.0.3"
 
 var revision = "HEAD"
+
+var durAliasRe = regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(mon(?:ths?)?|weeks?|days?|hours?|minutes?|mins?|seconds?|secs?|years?)`)
+
+func parseDuration(s string) (time.Duration, error) {
+	s = durAliasRe.ReplaceAllStringFunc(s, func(m string) string {
+		sm := durAliasRe.FindStringSubmatch(m)
+		num := sm[1]
+		unit := strings.ToLower(sm[2])
+		switch {
+		case strings.HasPrefix(unit, "year"):
+			n, _ := strconv.ParseFloat(num, 64)
+			return strconv.FormatInt(int64(n*365*24), 10) + "h"
+		case strings.HasPrefix(unit, "mon"):
+			n, _ := strconv.ParseFloat(num, 64)
+			return strconv.FormatInt(int64(n*30*24), 10) + "h"
+		case strings.HasPrefix(unit, "week"):
+			return num + "w"
+		case strings.HasPrefix(unit, "day"):
+			return num + "d"
+		case strings.HasPrefix(unit, "hour"):
+			return num + "h"
+		case strings.HasPrefix(unit, "min"):
+			return num + "m"
+		case strings.HasPrefix(unit, "sec"):
+			return num + "s"
+		}
+		return m
+	})
+	return str2duration.ParseDuration(s)
+}
 
 type XTicks struct {
 	Ticker plot.Ticker
@@ -124,9 +153,9 @@ func (t XTicks) Ticks(min, max float64) []plot.Tick {
 	return ticks
 }
 
-func generate(data [][]any, coin string, span int, sign func(*nostr.Event) error) (string, error) {
+func generate(data [][]any, coin string, span int) (*bytes.Buffer, error) {
 	if len(data) < 2 || len(data) > 43200 {
-		return "", errors.New("invalid request")
+		return nil, errors.New("invalid request")
 	}
 
 	sort.Slice(data, func(i, j int) bool {
@@ -141,7 +170,7 @@ func generate(data [][]any, coin string, span int, sign func(*nostr.Event) error
 		}
 		v, err := strconv.ParseFloat(d[1].(string), 64)
 		if err != nil {
-			return "", errors.New("invalid data")
+			return nil, errors.New("invalid data")
 		}
 		points = append(points, plotter.XY{
 			X: d[0].(float64) / 1000,
@@ -204,20 +233,54 @@ func generate(data [][]any, coin string, span int, sign func(*nostr.Event) error
 	p.Add(line)
 
 	var buf bytes.Buffer
-	w, err := p.WriterTo(5*vg.Inch, 4*vg.Inch, "png")
+	w, err := p.WriterTo(7*vg.Inch, 4*vg.Inch, "png")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	_, err = w.WriteTo(&buf)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+	return &buf, nil
+}
 
-	result, err := nostrbuild.Upload(&buf, sign)
-	if err != nil {
-		return "", err
+func parseContent(content string) (string, int, error) {
+	pat := regexp.MustCompile(`^[A-Z]+$`)
+	coin := "BTCJPY"
+	span := 180
+	tok := strings.Split(content, " ")
+	for i := 1; i < len(tok); i++ {
+		tmp, err := parseDuration(tok[i])
+		if err == nil {
+			span = int(tmp.Minutes())
+		} else if pat.MatchString(tok[i]) {
+			coin = tok[i]
+		} else {
+			return "", 0, err
+		}
 	}
-	return result.Data[0].URL, nil
+	return coin, span, nil
+}
+
+func fetchData(coin string, span int) ([][]any, error) {
+	interval := "1m"
+	if span >= 3000 {
+		interval = "30m"
+	} else if span >= 1000 {
+		interval = "5m"
+	}
+	resp, err := http.Get(fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=%s&interval=%s&limit=%d", coin, interval, span))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var data [][]any
+	err = json.NewDecoder(resp.Body).Decode(&data)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func handler(nsec string) func(w http.ResponseWriter, r *http.Request) {
@@ -255,52 +318,30 @@ func handler(nsec string) func(w http.ResponseWriter, r *http.Request) {
 			return ev.Sign(sk)
 		}
 
-		pat := regexp.MustCompile(`^[A-Z]+$`)
-		coin := "BTCJPY"
-		tok := strings.Split(ev.Content, " ")
-		span := 180
-		interval := "1m"
-		for i := 1; i < len(tok); i++ {
-			tmp, err := str2duration.ParseDuration(tok[i])
-			if err == nil {
-				span = int(tmp.Minutes())
-			} else if pat.MatchString(tok[i]) {
-				coin = tok[i]
-			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-
-		if span >= 3000 {
-			interval = "30m"
-		} else if span >= 1000 {
-			interval = "5m"
-		}
-		resp, err := http.Get(fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=%s&interval=%s&limit=%d", coin, interval, span))
+		coin, span, err := parseContent(ev.Content)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer resp.Body.Close()
 
-		var data [][]any
-		err = json.NewDecoder(resp.Body).Decode(&data)
+		data, err := fetchData(coin, span)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if span >= 3000 {
-			interval = "30m"
-		} else if span >= 1000 {
-			interval = "5m"
-		}
 
-		img, err := generate(data, coin, span, sign)
+		buf, err := generate(data, coin, span)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+
+		result, err := nostrbuild.Upload(buf, sign)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		img := result.Data[0].URL
 
 		log.Println(img)
 		eev.Content = img + "\n#ビットコインチャート"
@@ -328,13 +369,13 @@ func init() {
 }
 
 func main() {
-	var dsn string
 	var ver bool
-	var span time.Duration
+	var test bool
+	var output string
 
-	flag.StringVar(&dsn, "dsn", os.Getenv("DATABASE_URL"), "Database source")
-	flag.DurationVar(&span, "span", 180*time.Minute, "span")
 	flag.BoolVar(&ver, "v", false, "show version")
+	flag.BoolVar(&test, "test", false, "generate chart image locally without posting")
+	flag.StringVar(&output, "o", "output.png", "output filename for -test mode")
 	flag.Parse()
 
 	if ver {
@@ -343,6 +384,26 @@ func main() {
 	}
 
 	time.Local = time.FixedZone("Local", 9*60*60)
+
+	if test {
+		coin, span, err := parseContent(strings.Join(flag.Args(), " "))
+		if err != nil {
+			log.Fatal(err)
+		}
+		data, err := fetchData(coin, span)
+		if err != nil {
+			log.Fatal(err)
+		}
+		buf, err := generate(data, coin, span)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := os.WriteFile(output, buf.Bytes(), 0644); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("wrote %v", output)
+		return
+	}
 
 	nsec := os.Getenv("NULLPOGA_NSEC")
 	if nsec == "" {
