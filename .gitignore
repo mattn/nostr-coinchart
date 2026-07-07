@@ -4,3 +4,4 @@ k8s
 *.sh
 *.bat
 *.cmd
+output.png
